@@ -1,0 +1,289 @@
+---
+title: "Project ST308"
+author: "Luke Gregorio"
+date: "05/05/2021"
+output: html_document
+---
+
+#Reading In the Data
+
+Admittedly, the original dataset came from a personal list I created of films on a free trial of IMDBpro and IMDb database. The IMDb database was used to derive the is.star dummy (this was just the top 500 actors on there). This was omitted here because it was a dataset of many million films and actors and crew. I did not want to slow you down with that. I then manually added the personal 'watch'/'avoid' for each film for my classification problem. This was added on excel. Similarly, the categorical 'Genres' variable was constructed from the original IMDb 'Genre' variable and my own categorisation where necessary. 
+
+```{r}
+urlfile<-'https://raw.githubusercontent.com/lukegregorio/st308-project/main/st308%20my%20film%20dataset.csv'
+my_films<-read.csv(urlfile)
+```
+
+
+## Cleaning Up the Data for My Models
+
+first, turn imdb rating into numeric
+
+```{r}
+my_films$IMDb.Rating <- as.numeric(substring(my_films$IMDb.Rating, 1,3))
+
+```
+
+Create variables so that it is ready for the model. Adapt the 'Year' column so it is more appropriate for regression, it is now interpreted as 'how old'. Also, convert 'Ratings' into a binary classification response variable. Also delete numVotes as will not be used in analysis. Also, create dummy variable from categorical languages column. Clean up Genre errors
+
+```{r}
+my_films$'Years_Diff' <- 2021-my_films$Year
+my_films$'Watch' <- ifelse(my_films$Rating > 2, 1, 0)
+my_films$numvotes <- NULL
+my_films$'is.eng.lang' <- ifelse(my_films$Language == 'English', 1, 0)
+my_films$Genres[my_films$Genres == 'Horror/Thriller Action'] <- 'Horror/Thriller'
+my_films$Genres[my_films$Genres == 'Light  Romance'] <- 'Light'
+
+```
+
+Now create a new dataset which will include just the relevant predictors for my models
+
+```{r}
+my_films_model <- my_films[ , -c(3,4,6,9, 10,11,12,13)]
+
+```
+
+now take out any missing values
+
+```{r}
+my_films_model <- my_films_model[complete.cases(my_films_model) , ]
+```
+
+transform MOVIEmeter variable for regression
+
+```{r}
+my_films_model$MOVIEmeter <- log(my_films_model$MOVIEmeter)
+```
+
+now split into test and train data
+
+```{r}
+set.seed(123)
+train.index <- sample(nrow(my_films_model), size = round(0.666*nrow(my_films_model)))
+
+train <- my_films_model[train.index,]
+test <- my_films_model[-train.index,]
+```
+
+## Visualising and Peeking the Data
+
+Get an idea of densities in data
+
+```{r}
+table(my_films$Genres)
+table(my_films$Language)
+barplot(table(my_films$Country))
+barplot(table(my_films$Rating))
+```
+
+Get an idea of my data, try to see what variables are more important than others in predicting success
+
+```{r pressure, echo=FALSE}
+library(ggplot2)
+library(dplyr)
+
+ggplot(my_films%>%count(Genres, Watch)%>%mutate(pct=n/sum(n)), aes(fill=as.factor(Watch), x=Genres, y = pct)) + 
+  geom_bar(position="fill", stat="identity") + theme_classic() + ggtitle('Proportion of my Film Ratings by Genre') +
+scale_fill_manual(values=c("firebrick4", 'seagreen')) + labs(fill = 'Rating')  
+
+ggplot(my_films%>%na.omit()%>%group_by(Watch)%>%summarise(average.rating = mean(IMDb.Rating)), aes(x = as.factor(Watch), y= average.rating)) +
+  geom_col(fill = "#FF6666") + theme_minimal()  + ggtitle('Average IMDB Ratings') + xlab('My Rating') + ylab('Average IMDB Rating') 
+
+ggplot(my_films_model%>%na.omit()%>%group_by(Watch)%>%summarise(average.year = mean(Years_Diff)), aes(x = as.factor(Watch), y= average.year)) +
+  geom_col(fill = "#FF6666") + theme_minimal()  + ggtitle('Average Age of Film by my Ratings - Preference for Newer Films') + xlab('My Rating') + ylab('Average Film Age') 
+
+ggplot(my_films%>%count(Language, Watch)%>%mutate(pct=n/sum(n)), aes(fill=as.factor(Watch), x=Language, y = pct)) + 
+  geom_bar(position="fill", stat="identity") + theme_classic() + ggtitle('Proportion of my Film Ratings by Language') +
+  scale_fill_manual(values=c("firebrick4",  'seagreen')) + labs(fill = 'Rating')
+
+ggplot(my_films%>%count(Country, Watch)%>%mutate(pct=n/sum(n)), aes(fill=as.factor(Watch), x=Country, y = pct)) + 
+  geom_bar(position="fill", stat="identity") + theme_classic() + ggtitle('Proportion of my Film Ratings by Language') +
+  scale_fill_manual(values=c("firebrick4",  'seagreen')) + labs(fill = 'Rating')
+
+ggplot(my_films%>%count(has.star, Watch)%>%mutate(pct=n/sum(n)), aes(fill=as.factor(Watch), x=as.factor(has.star), y = pct)) + 
+  geom_bar(position="fill", stat="identity") + theme_classic() + ggtitle('Effect of a Star Actor on my Rating?') +
+  scale_fill_manual(values=c("firebrick4",  'seagreen')) + labs(fill = 'Rating') +xlab('Star in Film?')
+
+```
+-IMDb rating seems clearly important from there to include in my all my models
+
+
+Check for any serious problems of multicollinearity
+
+```{r}
+cor(my_films$Run.time, my_films$MOVIEmeter) 
+cor(my_films$Run.time, my_films$IMDb.Rating, use = "pairwise.complete.obs")
+cor(my_films$Run.time, as.numeric(my_films$Years_Diff))
+cor(my_films$MOVIEmeter ,my_films$IMDb.Rating, use = "pairwise.complete.obs") 
+cor(my_films$MOVIEmeter ,my_films$Years_Diff, use = "pairwise.complete.obs")
+cor(my_films$Years_Diff , my_films$IMDb.Rating, use = "pairwise.complete.obs")
+
+```
+
+#### Building the Models
+
+First, load library. Then build the simple model, just a few important predictors here, note the stan model generates predictions from the test data too in all of these examples
+
+```{r}
+library(rstan)
+simple.model.list <- list(N = nrow(train), y = train$Watch, has_star = train$has.star, N_new = nrow(test),
+                          is_eng_lang = train$is.eng.lang, IMDb_Rating = train$IMDb.Rating, 
+                          is_eng_lang_new = test$is.eng.lang, IMDb_Rating_new = test$IMDb.Rating, has_star_new = test$has.star)
+  
+simple.model <- stan(file = 'simple and significant.stan', data = simple.model.list,  init = 0, chains = 1, iter = 4000, seed = 1)
+
+```
+
+check for convergence and results
+
+```{r}
+print(simple.model)
+traceplot(simple.model)
+```
+
+Now build the next model. This includes all possible variables. Also includes interactions, these are motivated by my own conviction. EG interaction of 'Years_diff' and 'Run_time' as I reckon that I prefer the newer longer films compared to older films where my patience can be thinner when watching
+
+```{r}
+loads.and.loads.list <- list(N = nrow(train), N_new = nrow(test), y = train$Watch, has_star = train$has.star, age_runtime = train$Years_Diff*train$Run.time, Age = train$Years_Diff, Run_time = train$Run.time, is_eng_lang = train$is.eng.lang, moviemeter = train$MOVIEmeter, age_has_star = train$has.star*train$Years_Diff,  IMDb_Rating = train$IMDb.Rating, is_eng_lang_age = train$is.eng.lang*train$Years_Diff, has_star_new = test$has.star, age_runtime_new = test$Years_Diff*test$Run.time, Age_new = test$Years_Diff, Run_time_new = test$Run.time, is_eng_lang_new = test$is.eng.lang, moviemeter_new = test$MOVIEmeter, age_has_star_new = test$has.star*test$Years_Diff,  IMDb_Rating_new = test$IMDb.Rating, is_eng_lang_age_new = test$is.eng.lang*test$Years_Diff)
+
+loads.and.loads.model <- stan(file = 'loads and loads.stan', data = loads.and.loads.list,  init = 0, chains = 1, iter = 4000, seed = 1)
+
+```
+
+Check convergence and results
+
+```{r}
+print(loads.and.loads.model)
+plot(loads.and.loads.model)
+traceplot(loads.and.loads.model)
+```
+
+now do crossvalidation to find optimum lambda for Ridge model. load the relevant libraries
+
+```{r}
+library(tidyverse)
+library(broom)
+library(glmnet)
+
+lambdas <- 10^seq(3, -2, by = -.1)
+lambda_fit <- cv.glmnet(cbind(train[,-c(1,6)], train$Years_Diff*train$is.eng.lang, train$Years_Diff*train$Run.time) %>% data.matrix(), train$Watch, alpha = 0, lambda = lambdas)
+plot(lambda_fit)
+lambda_fit$lambda.min
+
+```
+-use result in stan file, notice lambda is small suggesting overfitting is not much of a problem
+
+
+Now build Ridge model
+
+```{r}
+ridge.model <- stan(file = 'ridge.stan', data = loads.and.loads.list,  init = 1, chains = 1, iter = 4000, seed = 1)
+```
+
+check convergence and results
+
+```{r}
+print(ridge.model)
+plot(ridge.model)
+traceplot(ridge.model)
+```
+
+build fixed effects model. turn into factor trick for ease in stan. check convergence and results
+
+
+```{r}
+train$Genres_num <- as.numeric(as.factor(train$Genres))
+test$Genres_num <- as.numeric(as.factor(test$Genres))
+
+hierarchical.list <- list(N = nrow(train), N_new = nrow(test), L = 5, genre = train$Genres_num, genre_test = test$Genres_num, y = train$Watch, has_star = train$has.star,  Age = train$Years_Diff, Run_time = train$Run.time, is_eng_lang = train$is.eng.lang, moviemeter = train$MOVIEmeter, IMDb_Rating = train$IMDb.Rating, has_star_new = test$has.star, age_runtime_new = test$Years_Diff*test$Run.time, Age_new = test$Years_Diff, Run_time_new = test$Run.time, is_eng_lang_new = test$is.eng.lang, moviemeter_new = test$MOVIEmeter, IMDb_Rating_new = test$IMDb.Rating)
+
+fixed.effects.model <- stan(file = 'fixed effects 2.stan', data = hierarchical.list, init = 0, chains = 1, iter = 4000, seed = 1)
+
+print(fixed.effects.model)
+traceplot(fixed.effects.model)
+```
+-notice the increased variance in test predictions, much more decisive, size of posterior 'mean' much larger too
+
+build hierarchical model. note that to ensure convergence, run more iterations and decrease step size
+
+```{r}
+
+hierarchical.model <- stan(file = 'actual multilevel logistic.stan', data = hierarchical.list, init = 0, chains = 1, iter = 10000, seed = 1, control=list(adapt_delta=0.9))
+
+```
+
+check convergence and results
+
+```{r}
+print(hierarchical.model)      
+traceplot(hierarchical.model)
+```
+
+##### Evaluate Models
+
+get predictions from stan object and convert to vector
+
+```{r}
+simple.predictions <- as.vector(summary(simple.model, pars = c('y_pred'))$summary[,6])
+
+```
+
+create confusion matrix
+
+```{r}
+simple.predictions <- cbind.data.frame(test$Watch, simple.predictions)
+confusion.simple <- table(simple.predictions$`test$Watch`, simple.predictions$simple.predictions)
+```
+
+get statistics on overall accuracy, sensitivity, specificity, and precision
+
+```{r}
+(confusion.simple[1,1] + confusion.simple[2,2])/117
+confusion.simple[2,2]/(confusion.simple[2,2] + confusion.simple[2,1])
+confusion.simple[1,1]/(confusion.simple[1,1] + confusion.simple[2,1])
+confusion.simple[2,2]/(confusion.simple[2,2] + confusion.simple[1,2])
+```
+
+repeat this for all the other models
+
+```{r}
+loads.and.loads.predictions <- as.vector(summary(loads.and.loads.model, pars = c('y_pred'))$summary[,6])
+loads.and.loads.predictions <- cbind.data.frame(test$Watch, loads.and.loads.predictions)
+confusion.loads.and.loads <- table(loads.and.loads.predictions$`test$Watch`, loads.and.loads.predictions$loads.and.loads.predictions)
+(confusion.loads.and.loads[1,1] + confusion.loads.and.loads[2,2])/117
+confusion.loads.and.loads[2,2]/(confusion.loads.and.loads[2,2] + confusion.loads.and.loads[2,1])
+confusion.loads.and.loads[1,1]/(confusion.loads.and.loads[1,1] + confusion.loads.and.loads[2,1])
+confusion.loads.and.loads[2,2]/(confusion.loads.and.loads[2,2] + confusion.loads.and.loads[1,2])
+
+
+ridge.predictions <- as.vector(summary(ridge.model, pars = c('y_pred'))$summary[,6])
+ridge.predictions <- cbind.data.frame(test$Watch, ridge.predictions)
+confusion.ridge <- table(ridge.predictions$`test$Watch`, ridge.predictions$ridge.predictions)
+(confusion.ridge[1,1] + confusion.ridge[2,2])/117
+confusion.ridge[2,2]/(confusion.ridge[2,2] + confusion.ridge[2,1])
+confusion.ridge[1,1]/(confusion.ridge[1,1] + confusion.ridge[2,1])
+confusion.ridge[2,2]/(confusion.ridge[2,2] + confusion.ridge[1,2])
+
+
+hierarchical.predictions <- as.vector(summary(hierarchical.model, pars = c('y_pred'))$summary[,6])
+hierarchical.predictions <- cbind.data.frame(test$Watch, hierarchical.predictions)
+confusion.hierarchical <- table(hierarchical.predictions$`test$Watch`, hierarchical.predictions$hierarchical.predictions)
+(confusion.hierarchical[1,1] + confusion.hierarchical[2,2])/117
+confusion.hierarchical[2,2]/(confusion.hierarchical[2,2] + confusion.hierarchical[2,1])
+confusion.hierarchical[1,1]/(confusion.hierarchical[1,1] + confusion.hierarchical[2,1])
+confusion.hierarchical[2,2]/(confusion.hierarchical[2,2] + confusion.hierarchical[1,2])
+
+
+fixed.effects.predictions <- as.vector(summary(fixed.effects.model, pars = c('y_pred'))$summary[,6])
+fixed.effects.predictions <- cbind.data.frame(test$Watch, fixed.effects.predictions)
+confusion.fixed.effects <- table(fixed.effects.predictions$`test$Watch`, fixed.effects.predictions$fixed.effects.predictions)
+(confusion.fixed.effects[1,1] + confusion.fixed.effects[2,2])/117
+confusion.fixed.effects[2,2]/(confusion.fixed.effects[2,2] + confusion.fixed.effects[2,1])
+confusion.fixed.effects[1,1]/(confusion.fixed.effects[1,1] + confusion.fixed.effects[2,1])
+confusion.fixed.effects[2,2]/(confusion.fixed.effects[2,2] + confusion.fixed.effects[1,2])
+
+```
+
+-results fairly similar across the board. simple model 'cheats' and generally always classifies as true which is a weakness
+-fixed effects is pretty strong model, despite the very responsive (very high or very low) posterior estimates that I was worried about originally
+
